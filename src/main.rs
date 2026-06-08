@@ -1987,10 +1987,14 @@ fn num_to_alpha(mut value: i64, width: usize) -> String {
 
 fn command_repeat(args: &RepeatArgs) -> String {
     let sep = args.sep.as_deref().unwrap_or("");
-    std::iter::repeat(args.value.as_str())
-        .take(args.count)
-        .collect::<Vec<_>>()
-        .join(sep)
+    let mut out = String::new();
+    for idx in 0..args.count {
+        if idx > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(&args.value);
+    }
+    out
 }
 
 fn command_pad(args: &PadArgs, global: &Global, input: Option<Data>) -> Result<Data> {
@@ -2430,7 +2434,7 @@ fn field_record_literal_positive<'a>(
                     selected[selection_idx].push(field);
                 }
                 PositiveFieldSelection::Range { start, end }
-                    if field_no >= start && end.map_or(true, |value| field_no <= value) =>
+                    if field_no >= start && field_no <= end.unwrap_or(field_no) =>
                 {
                     selected[selection_idx].push(field);
                 }
@@ -2906,8 +2910,9 @@ fn decode_value(bytes: &[u8], codec: &str, args: &EncArgs) -> Result<Vec<u8>> {
 }
 
 fn pad_base64(value: &str) -> String {
+    let padding = (4 - value.len() % 4) % 4;
     let mut padded = value.to_string();
-    while padded.len() % 4 != 0 {
+    for _ in 0..padding {
         padded.push('=');
     }
     padded

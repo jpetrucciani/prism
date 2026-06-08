@@ -45,6 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
       - uses: taiki-e/install-action@cargo-zigbuild
       - run: rustup target add x86_64-unknown-linux-musl
       - run: RUSTFLAGS="${RUSTFLAGS:-} -A linker-messages" cargo zigbuild --release --locked --all-features --target x86_64-unknown-linux-musl
