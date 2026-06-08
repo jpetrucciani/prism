@@ -1,6 +1,6 @@
 [package]
 name = "prism"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.96"
 description = "Generate and transform text records from the command line"
