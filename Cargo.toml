@@ -2,7 +2,7 @@
 name = "prism"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.98"
+rust-version = "1.96"
 description = "Generate and transform text records from the command line"
 license = "MIT"
 readme = "README.md"
