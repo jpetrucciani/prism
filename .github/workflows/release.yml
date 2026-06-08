@@ -2,9 +2,6 @@ name: release
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - 'v*'
   workflow_dispatch:
@@ -36,35 +33,16 @@ jobs:
 
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           tag="v${version}"
-          should_release=false
+          should_release=true
 
           if [ "${{ github.ref_type }}" = "tag" ]; then
             tag="${{ github.ref_name }}"
-            should_release=true
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            should_release=true
             if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
               git tag "${tag}"
               git push origin "${tag}"
-            fi
-          else
-            old_version=""
-            if git rev-parse HEAD^ >/dev/null 2>&1 && git show HEAD^:Cargo.toml >/tmp/old-Cargo.toml 2>/dev/null; then
-              old_version="$(python3 -c 'import tomllib; print(tomllib.load(open("/tmp/old-Cargo.toml", "rb"))["package"]["version"])')"
-            fi
-
-            if [ "${old_version}" != "${version}" ]; then
-              if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-                echo "tag ${tag} already exists; skipping automatic release"
-              else
-                git config user.name "github-actions[bot]"
-                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                git tag "${tag}"
-                git push origin "${tag}"
-                should_release=true
-              fi
             fi
           fi
 

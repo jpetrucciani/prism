@@ -1,0 +1,78 @@
+name: tag version
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tag-version:
+    name: tag Cargo.toml version
+    runs-on: ubuntu-latest
+    outputs:
+      should_tag: ${{ steps.version.outputs.should_tag }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: decide version tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          tag="v${version}"
+          should_tag=true
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            old_version=""
+            before="${{ github.event.before }}"
+            empty_before="0000000000000000000000000000000000000000"
+            if [ "${before}" != "${empty_before}" ] && git cat-file -e "${before}:Cargo.toml" 2>/dev/null; then
+              git show "${before}:Cargo.toml" >/tmp/old-Cargo.toml
+              old_version="$(python3 -c 'import tomllib; print(tomllib.load(open("/tmp/old-Cargo.toml", "rb"))["package"]["version"])')"
+            fi
+
+            if [ "${old_version}" = "${version}" ]; then
+              should_tag=false
+            fi
+          fi
+
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "should_tag=${should_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: push version tag
+        if: steps.version.outputs.should_tag == 'true'
+        env:
+          RELEASE_TRIGGER_TOKEN: ${{ secrets.RELEASE_TRIGGER_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RELEASE_TRIGGER_TOKEN}" ]; then
+            echo "RELEASE_TRIGGER_TOKEN is required so the pushed tag can trigger the release workflow." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${RELEASE_TRIGGER_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "tag ${RELEASE_TAG} already exists; skipping"
+            exit 0
+          fi
+
+          git tag "${RELEASE_TAG}"
+          git push origin "refs/tags/${RELEASE_TAG}"
