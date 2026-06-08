@@ -1,0 +1,55 @@
+[package]
+name = "prism"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.98"
+description = "Generate and transform text records from the command line"
+license = "MIT"
+readme = "README.md"
+keywords = ["cli", "text", "encoding", "hashing", "template"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = [
+    "**/__pycache__/**",
+    "tmp/**",
+]
+
+[dependencies]
+base64 = "0.22"
+blake2 = "0.10"
+blake3 = { version = "1.5", features = ["pure"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+crc32fast = "1.4"
+data-encoding = "2.6"
+digest = "0.10"
+directories = "6"
+hmac = "0.12"
+idna = "1"
+md-5 = "0.10"
+percent-encoding = "2.3"
+quoted_printable = "0.5"
+rand = "0.8"
+rand_chacha = "0.3"
+regex = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = "0.10"
+shell-words = "1.1"
+toml = "0.8"
+ulid = "1.1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.11"
+unicode-width = "0.2"
+uuid = "1.10"
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
+
+[dev-dependencies]
+
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 1

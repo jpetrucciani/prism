@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all --benches --tests --examples --all-features -- -D warnings
+      - run: cargo test --all-features
+      - run: cargo test --no-default-features
+
+  release-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --all-features
+      - run: python3 scripts/release_smoke.py --bin target/release/prism
+
+  performance-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 scripts/perf_matrix.py --build --iterations 3 --warmups 1 --output target/perf-ci-smoke.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prism-perf-ci-smoke
+          path: target/perf-ci-smoke.md
+
+  static-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-zigbuild
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: RUSTFLAGS="${RUSTFLAGS:-} -A linker-messages" cargo zigbuild --release --locked --all-features --target x86_64-unknown-linux-musl
