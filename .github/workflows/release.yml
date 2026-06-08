@@ -34,12 +34,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(python3 - <<'PY'
-          import tomllib
-          with open("Cargo.toml", "rb") as file:
-              print(tomllib.load(file)["package"]["version"])
-          PY
-          )"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           tag="v${version}"
           should_release=false
 
@@ -57,12 +52,7 @@ jobs:
           else
             old_version=""
             if git rev-parse HEAD^ >/dev/null 2>&1 && git show HEAD^:Cargo.toml >/tmp/old-Cargo.toml 2>/dev/null; then
-              old_version="$(python3 - <<'PY'
-              import tomllib
-              with open("/tmp/old-Cargo.toml", "rb") as file:
-                  print(tomllib.load(file)["package"]["version"])
-              PY
-              )"
+              old_version="$(python3 -c 'import tomllib; print(tomllib.load(open("/tmp/old-Cargo.toml", "rb"))["package"]["version"])')"
             fi
 
             if [ "${old_version}" != "${version}" ]; then
