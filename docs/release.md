@@ -6,7 +6,7 @@ This repository releases from GitHub Actions.
 
 On a push to `main` or `master` that changes `Cargo.toml`, `.github/workflows/tag-version.yml` compares the current package version with the version from the previous pushed revision. If the version changed and tag `v<version>` does not already exist, the workflow creates that tag.
 
-The tag workflow must push with a token stored as `RELEASE_TRIGGER_TOKEN`. The built-in `GITHUB_TOKEN` can push tags, but that tag push will not trigger the release workflow. A fine-grained personal access token or GitHub App installation token with repository contents write access is sufficient.
+The tag workflow must push with a token stored as `RELEASE_TRIGGER_TOKEN`. The built-in `GITHUB_TOKEN` can push tags, but that tag push will not trigger the release workflow. A fine-grained personal access token or GitHub App installation token with repository contents write access is sufficient. The checkout step disables persisted credentials so git uses `RELEASE_TRIGGER_TOKEN` for the tag push instead of the workflow `GITHUB_TOKEN`.
 
 `.github/workflows/release.yml` publishes releases from direct pushes of `v*` tags. Manual `workflow_dispatch` also releases the current `Cargo.toml` version and creates `v<version>` when missing.
 
