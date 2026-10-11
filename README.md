@@ -1,7 +1,7 @@
 # prism
 
 [![uses nix](https://img.shields.io/badge/uses-nix-%237EBAE4)](https://nixos.org/)
-![rust](https://img.shields.io/badge/Rust-1.98%2B-orange.svg)
+![rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
 
 `prism` is a static Rust CLI for small text jobs: dates, random strings, case conversion, slugs, fields, slicing, wrapping, encoding, hashing, templates, and linear record pipelines.
 
@@ -105,7 +105,6 @@ Rendering flags apply after the verb:
 | Flag           | Effect                                                                            |
 | -------------- | --------------------------------------------------------------------------------- |
 | `--json`       | Render each output record as a JSON string literal.                               |
-| `--raw`        | Suppress verb-specific quoting where supported. Mutually exclusive with `--json`. |
 | `--no-newline` | Drop only the final record terminator.                                            |
 
 ## Environment and config
@@ -119,7 +118,7 @@ Rendering flags apply after the verb:
 | `XDG_CONFIG_HOME`   | Moves the config path used for aliases and `[defaults]`.                                   |
 | Process environment | Exposed to `prism tpl` as template variables.                                              |
 
-Config `[defaults]` supports `seed`, `count`, `null`, `no_newline`, `raw`, `json`, `keep_going`, and `quiet`. Explicit CLI flags win over config defaults.
+Config `[defaults]` supports `seed`, `count`, `null`, `no_newline`, `json`, `keep_going`, and `quiet`. Explicit `--seed` and `-n` win over config defaults; boolean defaults can only be switched on, so use `--no-defaults` to ignore the `[defaults]` table for one invocation.
 
 Template variable precedence is `--set KEY=VALUE`, process environment, `--env-file`, then `${VAR:-default}` in the template. Use `--env-file-override` to let dotenv values override process environment values.
 
@@ -147,7 +146,6 @@ Before release, run:
 cargo fmt --check
 cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 cargo test --all-features
-cargo test --no-default-features
 cargo build --release --locked --all-features
 python3 scripts/release_smoke.py --bin target/release/prism
 python3 scripts/perf_matrix.py --build --iterations 5 --warmups 1 --output target/perf-matrix.md

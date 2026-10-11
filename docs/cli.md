@@ -10,12 +10,12 @@ This is the user-facing reference for the v1 command surface. `SPEC.md` remains 
 | `-o, --out <FILE>`  | Write output to file instead of stdout.                                            |
 | `--append`          | Append to `--out` instead of atomic replacement.                                   |
 | `--mkdir`           | Create missing parent directories for `--out`.                                     |
-| `--mode <OCTAL>`    | Set output file mode.                                                              |
+| `--file-mode <OCTAL>` | Set output file mode.                                                            |
 | `-n, --count <N>`   | Emit N records for generators. In chains, applies only to a first-stage generator. |
 | `-s, --seed <SEED>` | Make randomness deterministic.                                                     |
 | `-0, --null`        | Use NUL as input and output record separator.                                      |
 | `--no-newline`      | Omit the final trailing record separator.                                          |
-| `-r, --raw`         | Suppress verb-specific quoting or escaping.                                        |
+| `--no-defaults`     | Ignore the config `[defaults]` table for this invocation.                          |
 | `--json`            | Render each output record as a JSON string literal.                                |
 | `--keep-going`      | Continue per-record work after recoverable record errors.                          |
 | `-q, --quiet`       | Suppress non-fatal diagnostics.                                                    |
@@ -43,7 +43,7 @@ prism completions bash
 | `XDG_CONFIG_HOME`   | Moves the config path used for aliases and `[defaults]`.                             |
 | Process environment | Read by `tpl` as template variables.                                                 |
 
-Config `[defaults]` currently supports `seed`, `count`, `null`, `no_newline`, `raw`, `json`, `keep_going`, and `quiet`. Explicit CLI flags win over config defaults.
+Config `[defaults]` currently supports `seed`, `count`, `null`, `no_newline`, `json`, `keep_going`, and `quiet`. Explicit `--seed` and `-n` win over config defaults. Boolean defaults can only be switched on; `--no-defaults` ignores the table. A config `count` does not trip the chain `-n` check.
 
 ## Exit codes
 
@@ -220,6 +220,8 @@ prism lines --sort
 prism lines --sort --numeric --reverse
 ```
 
+`--number` is applied last, so it labels the final order after uniq, sort, shuffle, and reverse.
+
 ## Encoding
 
 ```sh
@@ -285,11 +287,16 @@ ${VAR}
 ${VAR:-default}
 ${VAR:?message}
 ${VAR:+alt}
+${VAR:-${OTHER}}
 ${@uuid}
 ${@now:%Y-%m-%d}
+${@now:%H:%M:%S}
+${@now:+1d:%F}
 ${@rand:hex:16}
 ${@slug:TEXT}
 ```
+
+Operands of `:-`, `:?`, and `:+` are expanded only when used. A helper's last argument is free text and may contain `:`. With `--seed`, every helper in one render draws from a single deterministic stream, so repeated helpers produce distinct values.
 
 For untrusted templates, use `--no-gen`, keep recursion off, and run with a scrubbed environment.
 

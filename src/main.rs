@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
@@ -32,13 +32,14 @@ use sha3::{Sha3_256, Sha3_512};
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 use xxhash_rust::xxh64::xxh64;
 
 const RNG_CONTRACT: &str = "prism-rng-v1";
 const WORDLIST_VERSION: &str = "builtin-demo-v1";
+const ALNUM: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const URL_ENCODE: &AsciiSet = &CONTROLS.add(b' ');
 const URL_COMPONENT_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -68,39 +69,33 @@ struct PrismError {
     code: i32,
     message: String,
     partial_records: Option<Vec<String>>,
+    broken_pipe: bool,
 }
 
 impl PrismError {
-    fn runtime(message: impl Into<String>) -> Self {
+    fn new(code: i32, message: impl Into<String>) -> Self {
         Self {
-            code: 1,
+            code,
             message: message.into(),
             partial_records: None,
+            broken_pipe: false,
         }
+    }
+
+    fn runtime(message: impl Into<String>) -> Self {
+        Self::new(1, message)
     }
 
     fn usage(message: impl Into<String>) -> Self {
-        Self {
-            code: 2,
-            message: message.into(),
-            partial_records: None,
-        }
+        Self::new(2, message)
     }
 
     fn template(message: impl Into<String>) -> Self {
-        Self {
-            code: 3,
-            message: message.into(),
-            partial_records: None,
-        }
+        Self::new(3, message)
     }
 
     fn recursion(message: impl Into<String>) -> Self {
-        Self {
-            code: 4,
-            message: message.into(),
-            partial_records: None,
-        }
+        Self::new(4, message)
     }
 }
 
@@ -114,7 +109,10 @@ impl std::error::Error for PrismError {}
 
 impl From<io::Error> for PrismError {
     fn from(value: io::Error) -> Self {
-        Self::runtime(value.to_string())
+        Self {
+            broken_pipe: value.kind() == io::ErrorKind::BrokenPipe,
+            ..Self::runtime(value.to_string())
+        }
     }
 }
 
@@ -125,7 +123,7 @@ type Result<T> = std::result::Result<T, PrismError>;
     name = "prism",
     version = env!("CARGO_PKG_VERSION"),
     about = "Generate and transform text records from the command line",
-    long_about = "prism is a Unix-style record pipeline for producing, transforming, encoding, hashing, and templating text.\n\nThe execution model is: acquire input, split into records, apply one verb, render each output record, then join records back together. Newline is the default record separator. Use -0/--null to switch both input splitting and output joining to NUL.\n\nGenerators such as dt, rand, seq, repeat, and pad with a positional value do not read stdin. Per-record transforms such as case, slug, trim, squeeze, replace, field, slice, and stdin-mode pad map over each record independently. Whole-stream transforms such as wrap, indent, dedent, lines, enc, hash, tpl, and quote consume the input as one unit unless the verb documents --per-line.\n\nEnvironment and defaults: prism keeps most behavior explicit and does not read broad PRISM_* option overrides. The dt verb uses PRISM_TZ, then TZ, as its default timezone when --tz and --utc are not set. XDG_CONFIG_HOME changes the config path used for aliases and defaults. Config [defaults] currently supports seed, count, null, no_newline, raw, json, keep_going, and quiet. The tpl verb reads the process environment as template variables, with --env-file and --set controlling precedence.\n\nExamples:\n  prism dt --utc --fmt '%Y-%m-%dT%H:%M:%SZ'\n  prism --seed demo rand --alnum 24\n  echo '  Hello World  ' | prism do 'trim | case snake | slug'\n  printf 'a\\nb\\n' | prism --json case upper\n\nUse --help on any verb for option-level details, for example: prism rand --help, prism enc --help, or prism tpl --help."
+    long_about = "prism is a Unix-style record pipeline for producing, transforming, encoding, hashing, and templating text.\n\nThe execution model is: acquire input, split into records, apply one verb, render each output record, then join records back together. Newline is the default record separator. Use -0/--null to switch both input splitting and output joining to NUL.\n\nGenerators such as dt, rand, seq, repeat, and pad with a positional value do not read stdin. Per-record transforms such as case, slug, trim, squeeze, replace, field, slice, and stdin-mode pad map over each record independently. Whole-stream transforms such as wrap, indent, dedent, lines, enc, hash, tpl, and quote consume the input as one unit unless the verb documents --per-line.\n\nEnvironment and defaults: prism keeps most behavior explicit and does not read broad PRISM_* option overrides. The dt verb uses PRISM_TZ, then TZ, as its default timezone when --tz and --utc are not set. XDG_CONFIG_HOME changes the config path used for aliases and defaults. Config [defaults] currently supports seed, count, null, no_newline, json, keep_going, and quiet; --no-defaults ignores them. The tpl verb reads the process environment as template variables, with --env-file and --set controlling precedence.\n\nExamples:\n  prism dt --utc --fmt '%Y-%m-%dT%H:%M:%SZ'\n  prism --seed demo rand --alnum 24\n  echo '  Hello World  ' | prism do 'trim | case snake | slug'\n  printf 'a\\nb\\n' | prism --json case upper\n\nUse --help on any verb for option-level details, for example: prism rand --help, prism enc --help, or prism tpl --help."
 )]
 #[command(
     args_conflicts_with_subcommands = false,
@@ -167,9 +165,6 @@ struct Global {
     /// Omit only the final record terminator.
     #[arg(long, global = true)]
     no_newline: bool,
-    /// Suppress verb-specific quoting where the verb supports quoted output.
-    #[arg(short = 'r', long, global = true)]
-    raw: bool,
     /// Render each finished output record as a JSON string literal.
     #[arg(long, global = true)]
     json: bool,
@@ -179,6 +174,12 @@ struct Global {
     /// Suppress nonessential diagnostics, including binary-mode rendering notes.
     #[arg(short = 'q', long, global = true)]
     quiet: bool,
+    /// Ignore the config [defaults] table for this invocation.
+    #[arg(long, global = true)]
+    no_defaults: bool,
+    /// Set when `count` came from config [defaults] rather than -n.
+    #[arg(skip)]
+    count_from_config: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -804,6 +805,8 @@ struct AliasOptions {
 fn main() {
     let code = match run() {
         Ok(()) => 0,
+        // A closed downstream pipe (`prism ... | head`) is a normal way to stop.
+        Err(err) if err.broken_pipe => 0,
         Err(err) => {
             eprintln!("prism: {err}");
             err.code
@@ -821,14 +824,13 @@ fn run() -> Result<()> {
         }
         Err(err) => return Err(err),
     };
-    let global = if matches!(cli.command, Command::Version | Command::Completions(_)) {
+    let global = if cli.global.no_defaults
+        || matches!(cli.command, Command::Version | Command::Completions(_))
+    {
         cli.global
     } else {
         apply_config_defaults(cli.global)?
     };
-    if global.raw && global.json {
-        return Err(PrismError::usage("--raw and --json are mutually exclusive"));
-    }
     if stream_output_fast_path(&cli.command, &global)? {
         return Ok(());
     }
@@ -883,11 +885,11 @@ fn apply_config_defaults(mut global: Global) -> Result<Global> {
             global.count = Some(usize::try_from(count).map_err(|err| {
                 PrismError::usage(format!("invalid defaults.count value: {err}"))
             })?);
+            global.count_from_config = true;
         }
     }
     apply_bool_default(&mut global.null, &config, "null");
     apply_bool_default(&mut global.no_newline, &config, "no_newline");
-    apply_bool_default(&mut global.raw, &config, "raw");
     apply_bool_default(&mut global.json, &config, "json");
     apply_bool_default(&mut global.keep_going, &config, "keep_going");
     apply_bool_default(&mut global.quiet, &config, "quiet");
@@ -904,60 +906,25 @@ fn apply_bool_default(target: &mut bool, config: &Config, key: &str) {
 
 fn parse_cli() -> Result<Cli> {
     let mut args: Vec<OsString> = env::args_os().collect();
-    if args.len() > 1 {
-        if let Some(first) = args.get(1).and_then(|arg| arg.to_str()) {
-            if is_potential_bare_alias(first) && !is_builtin(first) {
-                if let Ok(config) = load_config() {
-                    if config.alias.options.expand_bare && config.alias.entries.contains_key(first)
-                    {
-                        let alias = OsString::from(first);
-                        args[1] = OsString::from("run");
-                        args.insert(2, alias);
-                    }
+    if let Some(first) = args.get(1).and_then(|arg| arg.to_str()).map(str::to_string) {
+        if !first.starts_with('-') && !is_builtin(&first) {
+            if let Ok(config) = load_config() {
+                if config.alias.options.expand_bare && config.alias.entries.contains_key(&first) {
+                    args[1] = OsString::from("run");
+                    args.insert(2, OsString::from(first));
                 }
             }
         }
     }
-    Cli::try_parse_from(args).map_err(|err| PrismError {
-        code: if err.use_stderr() { 2 } else { 0 },
-        message: err.to_string(),
-        partial_records: None,
-    })
-}
-
-fn is_potential_bare_alias(value: &str) -> bool {
-    !value.starts_with('-')
+    Cli::try_parse_from(args)
+        .map_err(|err| PrismError::new(if err.use_stderr() { 2 } else { 0 }, err.to_string()))
 }
 
 fn is_builtin(value: &str) -> bool {
-    matches!(
-        value,
-        "dt" | "rand"
-            | "seq"
-            | "repeat"
-            | "pad"
-            | "case"
-            | "slug"
-            | "trim"
-            | "squeeze"
-            | "wrap"
-            | "indent"
-            | "dedent"
-            | "replace"
-            | "field"
-            | "slice"
-            | "lines"
-            | "enc"
-            | "hash"
-            | "tpl"
-            | "quote"
-            | "do"
-            | "alias"
-            | "run"
-            | "x"
-            | "completions"
-            | "version"
-    )
+    value == "help"
+        || Cli::command()
+            .get_subcommands()
+            .any(|command| command.get_name() == value)
 }
 
 fn execute_command(
@@ -1027,6 +994,7 @@ fn execute_command(
             let selections = parse_field_spec(&args.spec)?;
             let osep = decode_escapes(&args.osep);
             let delimiter_regex = compile_field_delimiter_regex(args)?;
+            let args = &decode_field_delimiter(args);
             map_records(global, input, args.value.as_deref(), |record| {
                 field_record(record, args, &selections, &osep, delimiter_regex.as_ref())
             })
@@ -1153,45 +1121,66 @@ fn stream_records_to_file_fast_path(
     Ok(true)
 }
 
+fn input_reader(global: &Global) -> Result<BufReader<Box<dyn Read>>> {
+    let source: Box<dyn Read> = match &global.input {
+        Some(path) if path.as_os_str() != "-" => Box::new(File::open(path)?),
+        _ => Box::new(io::stdin().lock()),
+    };
+    Ok(BufReader::with_capacity(64 * 1024, source))
+}
+
 fn stream_records_to_writer<W, F>(global: &Global, writer: &mut W, mut transform: F) -> Result<()>
 where
     W: Write,
     F: FnMut(&str) -> Result<String>,
 {
-    let mut bytes = read_input_bytes(global)?;
+    let mut reader = input_reader(global)?;
     let sep_byte = if global.null { 0 } else { b'\n' };
-    if bytes.last().copied() == Some(sep_byte) {
-        bytes.pop();
-    }
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|err| PrismError::runtime(format!("invalid UTF-8 input: {err}")))?;
     let sep = if global.null { "\0" } else { "\n" };
-    let split = if global.null { '\0' } else { '\n' };
+    let mut buf = Vec::new();
+    let mut idx = 0;
     let mut emitted = false;
     let mut had_error = false;
-    for (idx, record) in text.split(split).enumerate() {
+    loop {
+        // Flush before blocking on more input so live streams (`tail -f`) see output promptly.
+        if reader.buffer().is_empty() {
+            writer.flush()?;
+        }
+        buf.clear();
+        if reader.read_until(sep_byte, &mut buf)? == 0 {
+            break;
+        }
+        if buf.last() == Some(&sep_byte) {
+            buf.pop();
+        }
+        // Match split_records: input that is exactly one separator holds no records.
+        if idx == 0 && buf.is_empty() && reader.fill_buf()?.is_empty() {
+            break;
+        }
+        idx += 1;
+        let record = std::str::from_utf8(&buf)
+            .map_err(|err| PrismError::runtime(format!("invalid UTF-8 input: {err}")))?;
         match transform(record) {
             Ok(value) => {
-                if emitted {
+                // Terminate each record immediately so live consumers see complete lines;
+                // only --no-newline has to hold the separator back until the next record.
+                if emitted && global.no_newline {
                     writer.write_all(sep.as_bytes())?;
                 }
                 write_streamed_record(writer, &value, global.json)?;
+                if !global.no_newline {
+                    writer.write_all(sep.as_bytes())?;
+                }
                 emitted = true;
             }
             Err(err) if global.keep_going => {
                 had_error = true;
                 if !global.quiet {
-                    eprintln!("prism: record {}: {err}", idx + 1);
+                    eprintln!("prism: record {idx}: {err}");
                 }
             }
             Err(err) => return Err(err),
         }
-    }
-    if emitted && !global.no_newline {
-        writer.write_all(sep.as_bytes())?;
     }
     if had_error {
         return Err(PrismError::runtime("one or more records failed"));
@@ -1202,7 +1191,7 @@ where
 fn write_streamed_record<W: Write>(writer: &mut W, value: &str, json: bool) -> Result<()> {
     if json {
         serde_json::to_writer(&mut *writer, value)
-            .map_err(|err| PrismError::runtime(format!("json render failed: {err}")))
+            .map_err(|err| PrismError::from(io::Error::from(err)))
     } else {
         writer.write_all(value.as_bytes()).map_err(PrismError::from)
     }
@@ -1265,10 +1254,10 @@ impl RecordTransform {
                     PrismError::runtime(format!("encoded value is not UTF-8: {err}"))
                 })
             }),
-            Self::Hash(args) => format_digest(
-                hash_bytes(record.as_bytes(), &args.algorithm, args.key.as_deref())?,
+            Self::Hash(args) => Ok(format_digest(
+                &hash_bytes(record.as_bytes(), &args.algorithm, args.key.as_deref())?,
                 args,
-            ),
+            )),
         }
     }
 }
@@ -1309,7 +1298,7 @@ fn record_transform(command: &Command) -> Result<Option<RecordTransform>> {
             let osep = decode_escapes(&args.osep);
             let delimiter_regex = compile_field_delimiter_regex(args)?;
             Ok(Some(RecordTransform::Field {
-                args: args.clone(),
+                args: decode_field_delimiter(args),
                 selections,
                 osep,
                 delimiter_regex,
@@ -1374,9 +1363,8 @@ where
     }
     if had_error {
         return Err(PrismError {
-            code: 1,
-            message: "one or more records failed".to_string(),
             partial_records: Some(out),
+            ..PrismError::runtime("one or more records failed")
         });
     }
     Ok(Data::Records(out))
@@ -1492,8 +1480,8 @@ where
 fn apply_mode(existing: &Path, tmp: &Path, global: &Global) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = if let Some(mode) = &global.file_mode {
-        u32::from_str_radix(mode.trim_start_matches('0'), 8)
-            .map_err(|err| PrismError::usage(format!("invalid --mode: {err}")))?
+        u32::from_str_radix(mode, 8)
+            .map_err(|err| PrismError::usage(format!("invalid --file-mode: {err}")))?
     } else if existing.exists() {
         fs::metadata(existing)?.permissions().mode() & 0o7777
     } else {
@@ -1520,7 +1508,7 @@ fn command_dt(args: &DtArgs, global: &Global) -> Result<Vec<String>> {
         } else {
             dt
         };
-        out.push(format_datetime(shifted, args));
+        out.push(format_datetime(shifted, args)?);
     }
     Ok(out)
 }
@@ -1575,6 +1563,12 @@ fn env_timezone(name: &str) -> Option<(String, String)> {
 
 fn parse_datetime(value: &str, args: &DtArgs) -> Result<DateTime<chrono::FixedOffset>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        if args.utc {
+            return Ok(dt.with_timezone(&Utc).fixed_offset());
+        }
+        if let Some(tz) = configured_timezone(args)? {
+            return Ok(dt.with_timezone(&tz).fixed_offset());
+        }
         return Ok(dt);
     }
     if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
@@ -1643,14 +1637,20 @@ fn apply_offset(
         }
         let unit = &offset[unit_start..index];
         let amount = number * sign;
+        let out_of_range = || PrismError::runtime(format!("offset {offset} is out of range"));
+        let shift = |delta: Option<Duration>| {
+            delta
+                .and_then(|delta| dt.checked_add_signed(delta))
+                .ok_or_else(out_of_range)
+        };
         dt = match unit {
-            "y" => add_months(dt, amount * 12)?,
+            "y" => add_months(dt, amount.checked_mul(12).ok_or_else(out_of_range)?)?,
             "mo" => add_months(dt, amount)?,
-            "w" => dt + Duration::weeks(i64::from(amount)),
-            "d" => dt + Duration::days(i64::from(amount)),
-            "h" => dt + Duration::hours(i64::from(amount)),
-            "m" => dt + Duration::minutes(i64::from(amount)),
-            "s" => dt + Duration::seconds(i64::from(amount)),
+            "w" => shift(Duration::try_weeks(i64::from(amount)))?,
+            "d" => shift(Duration::try_days(i64::from(amount)))?,
+            "h" => shift(Duration::try_hours(i64::from(amount)))?,
+            "m" => shift(Duration::try_minutes(i64::from(amount)))?,
+            "s" => shift(Duration::try_seconds(i64::from(amount)))?,
             _ => return Err(PrismError::usage(format!("invalid offset unit: {unit}"))),
         };
     }
@@ -1662,7 +1662,9 @@ fn add_months(
     months: i32,
 ) -> Result<DateTime<chrono::FixedOffset>> {
     let naive = dt.naive_local();
-    let total = naive.year() * 12 + i32::from(naive.month() as u16) - 1 + months;
+    let total = (naive.year() * 12 + i32::from(naive.month() as u16) - 1)
+        .checked_add(months)
+        .ok_or_else(|| PrismError::runtime("month arithmetic is out of range"))?;
     let year = total.div_euclid(12);
     let month = (total.rem_euclid(12) + 1) as u32;
     let day = naive.day().min(last_day_of_month(year, month)?);
@@ -1686,23 +1688,33 @@ fn last_day_of_month(year: i32, month: u32) -> Result<u32> {
     Ok((first_next - Duration::days(1)).day())
 }
 
-fn format_datetime(dt: DateTime<chrono::FixedOffset>, args: &DtArgs) -> String {
+fn format_datetime(dt: DateTime<chrono::FixedOffset>, args: &DtArgs) -> Result<String> {
     if args.epoch {
-        return dt.timestamp().to_string();
+        return Ok(dt.timestamp().to_string());
     }
     if args.epoch_ms {
-        return dt.timestamp_millis().to_string();
+        return Ok(dt.timestamp_millis().to_string());
     }
     if args.rfc2822 {
-        return dt.to_rfc2822();
+        return Ok(dt.to_rfc2822());
     }
     if let Some(fmt) = &args.fmt {
-        return dt.format(fmt).to_string();
+        return strftime(&dt, fmt);
     }
-    if args.iso || args.rfc3339 {
-        return dt.to_rfc3339();
-    }
-    dt.to_rfc3339()
+    Ok(dt.to_rfc3339())
+}
+
+/// chrono's `format().to_string()` panics on bad patterns; writing surfaces the error instead.
+fn strftime<Tz>(dt: &DateTime<Tz>, fmt: &str) -> Result<String>
+where
+    Tz: TimeZone,
+    Tz::Offset: Display,
+{
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    write!(out, "{}", dt.format(fmt))
+        .map_err(|_| PrismError::usage(format!("invalid datetime format: {fmt}")))?;
+    Ok(out)
 }
 
 fn command_rand(args: &RandArgs, global: &Global) -> Result<Data> {
@@ -1721,24 +1733,17 @@ fn command_rand(args: &RandArgs, global: &Global) -> Result<Data> {
     Ok(Data::Records(out))
 }
 
+/// Seeded runs derive a stable key per stream; unseeded runs use OS entropy.
 fn rng_from_global(global: &Global, stream: &str) -> ChaCha20Rng {
-    let seed = global.seed.as_deref().unwrap_or("entropy");
+    let Some(seed) = global.seed.as_deref() else {
+        return ChaCha20Rng::from_entropy();
+    };
     let mut hasher = blake3::Hasher::new();
     hasher.update(RNG_CONTRACT.as_bytes());
     hasher.update(WORDLIST_VERSION.as_bytes());
     hasher.update(stream.as_bytes());
     hasher.update(seed.as_bytes());
-    if global.seed.is_none() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        hasher.update(&now.to_le_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut key = [0_u8; 32];
-    key.copy_from_slice(digest.as_bytes());
-    ChaCha20Rng::from_seed(key)
+    ChaCha20Rng::from_seed(*hasher.finalize().as_bytes())
 }
 
 fn rand_text(args: &RandArgs, global: &Global, rng: &mut ChaCha20Rng) -> Result<String> {
@@ -1748,11 +1753,7 @@ fn rand_text(args: &RandArgs, global: &Global, rng: &mut ChaCha20Rng) -> Result<
         return Ok(hex_encode(&bytes, false));
     }
     if let Some(len) = args.alnum {
-        return Ok(random_from_charset(
-            rng,
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            len,
-        ));
+        return Ok(random_from_charset(rng, ALNUM, len));
     }
     if let Some(len) = args.alpha {
         return Ok(random_from_charset(
@@ -1785,30 +1786,35 @@ fn rand_text(args: &RandArgs, global: &Global, rng: &mut ChaCha20Rng) -> Result<
         return Ok(random_from_charset(rng, charset, len));
     }
     if args.uuid {
-        let mut bytes = [0_u8; 16];
-        rng.fill_bytes(&mut bytes);
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        return Ok(Uuid::from_bytes(bytes).to_string());
+        return Ok(uuid4_from_rng(rng).to_string());
     }
     if args.uuid7 {
-        return Ok(uuid7_from_rng(rng, timestamp_ms(args, global)).to_string());
+        return Ok(uuid7_from_rng(rng, timestamp_ms(args.now, global)).to_string());
     }
     if args.ulid {
-        return Ok(ulid_from_rng(rng, timestamp_ms(args, global)).to_string());
+        return Ok(ulid_from_rng(rng, timestamp_ms(args.now, global)).to_string());
     }
     if let Some(count) = args.words {
         let words = load_wordlist(args.wordlist.as_deref())?;
-        let mut selected = Vec::with_capacity(count);
-        for _ in 0..count {
-            let word = words
-                .choose(rng)
-                .ok_or_else(|| PrismError::runtime("wordlist is empty"))?;
-            selected.push(word.clone());
-        }
-        return Ok(selected.join(&args.sep));
+        return random_words(rng, &words, count, &args.sep);
     }
     Err(PrismError::usage("choose a rand mode"))
+}
+
+fn random_words(
+    rng: &mut ChaCha20Rng,
+    words: &[String],
+    count: usize,
+    sep: &str,
+) -> Result<String> {
+    let mut selected = Vec::with_capacity(count);
+    for _ in 0..count {
+        let word = words
+            .choose(rng)
+            .ok_or_else(|| PrismError::runtime("wordlist is empty"))?;
+        selected.push(word.as_str());
+    }
+    Ok(selected.join(sep))
 }
 
 fn random_from_charset(rng: &mut ChaCha20Rng, charset: &str, len: usize) -> String {
@@ -1822,8 +1828,8 @@ fn random_from_charset(rng: &mut ChaCha20Rng, charset: &str, len: usize) -> Stri
     out
 }
 
-fn timestamp_ms(args: &RandArgs, global: &Global) -> u64 {
-    if let Some(now) = args.now {
+fn timestamp_ms(now: Option<u64>, global: &Global) -> u64 {
+    if let Some(now) = now {
         return now;
     }
     if let Some(seed) = &global.seed {
@@ -1836,6 +1842,14 @@ fn timestamp_ms(args: &RandArgs, global: &Global) -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn uuid4_from_rng(rng: &mut ChaCha20Rng) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    rng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 fn uuid7_from_rng(rng: &mut ChaCha20Rng, timestamp_ms: u64) -> Uuid {
@@ -2020,20 +2034,21 @@ fn pad_record(record: &str, args: &PadArgs) -> String {
     } else {
         &args.fill
     };
+    let mode = args.width_mode;
     if args.left.is_some() {
-        return format!("{}{}", repeat_fill(fill, needed), record);
+        return format!("{}{}", repeat_fill(fill, needed, mode), record);
     }
     if args.center.is_some() {
         let left = needed / 2;
         let right = needed - left;
         return format!(
             "{}{}{}",
-            repeat_fill(fill, left),
+            repeat_fill(fill, left, mode),
             record,
-            repeat_fill(fill, right)
+            repeat_fill(fill, right, mode)
         );
     }
-    format!("{}{}", record, repeat_fill(fill, needed))
+    format!("{}{}", record, repeat_fill(fill, needed, mode))
 }
 
 fn measure_width(value: &str, mode: WidthMode) -> usize {
@@ -2044,8 +2059,29 @@ fn measure_width(value: &str, mode: WidthMode) -> usize {
     }
 }
 
-fn repeat_fill(fill: &str, width: usize) -> String {
-    fill.repeat(width)
+/// Cycles `fill` until exactly `width` units are used; spaces cover a wide char that won't fit.
+fn repeat_fill(fill: &str, width: usize, mode: WidthMode) -> String {
+    let char_width = |ch: char| match mode {
+        WidthMode::Chars => 1,
+        WidthMode::Bytes => ch.len_utf8(),
+        WidthMode::Display => UnicodeWidthChar::width(ch).unwrap_or(0),
+    };
+    let units: Vec<(char, usize)> = fill
+        .chars()
+        .map(|ch| (ch, char_width(ch)))
+        .filter(|(_, w)| *w > 0)
+        .collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for (ch, w) in units.iter().copied().cycle() {
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.extend(std::iter::repeat_n(' ', width - used));
+    out
 }
 
 fn words(value: &str) -> Vec<String> {
@@ -2527,6 +2563,15 @@ fn compile_field_delimiter_regex(args: &FieldArgs) -> Result<Option<Regex>> {
         .map_err(|err| PrismError::usage(format!("invalid delimiter regex: {err}")))
 }
 
+/// Literal delimiters accept the same `\t`, `\n`, `\0` escapes as `--osep`; regexes handle their own.
+fn decode_field_delimiter(args: &FieldArgs) -> FieldArgs {
+    let mut args = args.clone();
+    if !args.regex {
+        args.delimiter = args.delimiter.as_deref().map(decode_escapes);
+    }
+    args
+}
+
 fn split_fields<'a>(
     record: &'a str,
     args: &FieldArgs,
@@ -2651,10 +2696,10 @@ fn slice_bytes(record: &str, selection: SliceSelection) -> Result<String> {
                 .min(len);
             (start, end)
         }
-        SliceSelection::Index(idx) => {
-            let start = resolve_slice_index(idx, len).min(len);
-            (start, (start + 1).min(len))
-        }
+        SliceSelection::Index(idx) => match resolve_slice_point(idx, len) {
+            Some(start) => (start, start + 1),
+            None => return Ok(String::new()),
+        },
     };
     if start >= end {
         return Ok(String::new());
@@ -2679,10 +2724,10 @@ fn slice_chars(record: &str, selection: SliceSelection) -> Result<String> {
                 .min(len);
             (start, end)
         }
-        SliceSelection::Index(idx) => {
-            let start = resolve_slice_index(idx, len).min(len);
-            (start, (start + 1).min(len))
-        }
+        SliceSelection::Index(idx) => match resolve_slice_point(idx, len) {
+            Some(start) => (start, start + 1),
+            None => return Ok(String::new()),
+        },
     };
     if start >= end {
         return Ok(String::new());
@@ -2718,11 +2763,21 @@ fn slice_units(units: &[String], selection: SliceSelection) -> Vec<String> {
                 units[start..end].to_vec()
             }
         }
-        SliceSelection::Index(idx) => {
-            let idx = resolve_slice_index(idx, units.len());
-            units.get(idx).cloned().into_iter().collect()
-        }
+        SliceSelection::Index(idx) => resolve_slice_point(idx, units.len())
+            .map(|idx| units[idx].clone())
+            .into_iter()
+            .collect(),
     }
+}
+
+/// Resolves a single index, returning None when it falls outside the record.
+fn resolve_slice_point(index: isize, len: usize) -> Option<usize> {
+    let idx = if index >= 0 {
+        usize::try_from(index).ok()?
+    } else {
+        len.checked_sub(index.unsigned_abs())?
+    };
+    (idx < len).then_some(idx)
 }
 
 fn resolve_slice_index(index: isize, len: usize) -> usize {
@@ -2739,13 +2794,6 @@ fn lines_records(
     args: &LinesArgs,
     global: &Global,
 ) -> Result<Vec<String>> {
-    if args.number {
-        records = records
-            .into_iter()
-            .enumerate()
-            .map(|(idx, record)| format!("{}\t{}", idx + 1, record))
-            .collect();
-    }
     if args.uniq {
         let mut out = Vec::new();
         let mut prev: Option<String> = None;
@@ -2784,6 +2832,14 @@ fn lines_records(
     if args.reverse {
         records.reverse();
     }
+    // Number last so it labels the final order and doesn't defeat uniq/sort.
+    if args.number {
+        records = records
+            .into_iter()
+            .enumerate()
+            .map(|(idx, record)| format!("{}\t{}", idx + 1, record))
+            .collect();
+    }
     Ok(records)
 }
 
@@ -2810,7 +2866,7 @@ fn command_enc(args: &EncArgs, global: &Global, input: Option<Data>) -> Result<D
 fn enc_value(bytes: &[u8], args: &EncArgs) -> Result<Vec<u8>> {
     let codec = args.codec.as_str();
     if args.decode {
-        decode_value(bytes, codec, args)
+        decode_value(bytes, codec)
     } else {
         encode_value(bytes, codec, args)
     }
@@ -2863,7 +2919,7 @@ fn encode_value(bytes: &[u8], codec: &str, args: &EncArgs) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn decode_value(bytes: &[u8], codec: &str, args: &EncArgs) -> Result<Vec<u8>> {
+fn decode_value(bytes: &[u8], codec: &str) -> Result<Vec<u8>> {
     let value = String::from_utf8(bytes.to_vec())
         .map_err(|err| PrismError::runtime(format!("invalid UTF-8: {err}")))?;
     match codec {
@@ -2901,12 +2957,6 @@ fn decode_value(bytes: &[u8], codec: &str, args: &EncArgs) -> Result<Vec<u8>> {
         "shell" => Err(PrismError::usage("shell codec is encode-only")),
         other => Err(PrismError::usage(format!("unknown codec: {other}"))),
     }
-    .map(|mut out| {
-        if args.no_pad && matches!(codec, "base64" | "base64url") {
-            out.shrink_to_fit();
-        }
-        out
-    })
 }
 
 fn pad_base64(value: &str) -> String {
@@ -2981,22 +3031,21 @@ fn ascii85_encode(bytes: &[u8]) -> String {
 fn ascii85_decode(value: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for chunk in value.as_bytes().chunks(5) {
+        if chunk.len() == 1 {
+            return Err(PrismError::runtime("truncated ascii85 group"));
+        }
         let mut digits = [b'u'; 5];
         digits[..chunk.len()].copy_from_slice(chunk);
-        let mut acc = 0_u32;
+        let mut acc = 0_u64;
         for digit in digits {
             if !(33..=117).contains(&digit) {
                 return Err(PrismError::runtime("invalid ascii85 digit"));
             }
-            acc = acc * 85 + u32::from(digit - 33);
+            acc = acc * 85 + u64::from(digit - 33);
         }
-        let bytes = acc.to_be_bytes();
-        let take = if chunk.len() < 5 {
-            chunk.len().saturating_sub(1)
-        } else {
-            4
-        };
-        out.extend_from_slice(&bytes[..take]);
+        let acc =
+            u32::try_from(acc).map_err(|_| PrismError::runtime("ascii85 group out of range"))?;
+        out.extend_from_slice(&acc.to_be_bytes()[..chunk.len() - 1]);
     }
     Ok(out)
 }
@@ -3047,15 +3096,15 @@ fn command_hash(args: &HashArgs, global: &Global, input: Option<Data>) -> Result
     }
     if args.per_line {
         return map_records(global, input, args.value.as_deref(), |record| {
-            format_digest(
-                hash_bytes(record.as_bytes(), &args.algorithm, args.key.as_deref())?,
+            Ok(format_digest(
+                &hash_bytes(record.as_bytes(), &args.algorithm, args.key.as_deref())?,
                 args,
-            )
+            ))
         });
     }
     let bytes = input_bytes(global, input, args.value.as_deref())?;
     let digest = hash_bytes(&bytes, &args.algorithm, args.key.as_deref())?;
-    Ok(Data::Records(vec![format_digest(digest, args)?]))
+    Ok(Data::Records(vec![format_digest(&digest, args)]))
 }
 
 fn hash_bytes(bytes: &[u8], algorithm: &str, key: Option<&str>) -> Result<Vec<u8>> {
@@ -3123,44 +3172,48 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn format_digest(mut digest: Vec<u8>, args: &HashArgs) -> Result<String> {
+fn format_digest(digest: &[u8], args: &HashArgs) -> String {
     let mut out = if args.base64 {
-        B64.encode(&digest)
+        B64.encode(digest)
     } else {
-        hex_encode(&digest, args.upper)
+        hex_encode(digest, args.upper)
     };
     if let Some(short) = args.short {
-        out = out.chars().take(short).collect();
+        out.truncate(short);
     }
-    digest.clear();
-    Ok(out)
+    out
 }
 
 fn render_template(input: &str, args: &TplArgs, global: &Global) -> Result<String> {
-    let vars = template_vars(args)?;
-    if args.recursive {
-        let mut current = input.to_string();
-        let mut seen = HashSet::new();
-        for depth in 0..args.max_depth {
-            if !seen.insert(current.clone()) {
+    let mut template = Template {
+        args,
+        global,
+        vars: template_vars(args)?,
+        // One RNG per render so repeated helpers differ while staying seed-deterministic.
+        rng: rng_from_global(global, "tpl"),
+    };
+    if !args.recursive {
+        return template.expand(input);
+    }
+    let mut current = input.to_string();
+    let mut seen = HashSet::new();
+    for depth in 0..args.max_depth {
+        if !seen.insert(current.clone()) {
+            return Err(PrismError::recursion("template recursion cycle detected"));
+        }
+        let next = template.expand(&current)?;
+        if next == current {
+            if current.contains("${") {
                 return Err(PrismError::recursion("template recursion cycle detected"));
             }
-            let next = expand_template_once(&current, args, global, &vars, &[])?;
-            if next == current {
-                if current.contains("${") {
-                    return Err(PrismError::recursion("template recursion cycle detected"));
-                }
-                return Ok(next);
-            }
-            current = next;
-            if depth + 1 == args.max_depth {
-                return Err(PrismError::recursion("template recursion depth exceeded"));
-            }
+            return Ok(next);
         }
-        Err(PrismError::recursion("template recursion depth exceeded"))
-    } else {
-        expand_template_once(input, args, global, &vars, &[])
+        current = next;
+        if depth + 1 == args.max_depth {
+            return Err(PrismError::recursion("template recursion depth exceeded"));
+        }
     }
+    Err(PrismError::recursion("template recursion depth exceeded"))
 }
 
 fn template_vars(args: &TplArgs) -> Result<HashMap<String, String>> {
@@ -3198,239 +3251,163 @@ fn read_dotenv(path: Option<&Path>) -> Result<HashMap<String, String>> {
     Ok(vars)
 }
 
-fn expand_template_once(
-    input: &str,
-    args: &TplArgs,
-    global: &Global,
-    vars: &HashMap<String, String>,
-    stack: &[String],
-) -> Result<String> {
-    let mut out = String::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut idx = 0;
-    while idx < chars.len() {
-        if chars[idx] == '$' && chars.get(idx + 1) == Some(&'{') {
-            let start = idx + 2;
-            let mut depth = 1;
-            let mut end = start;
-            while end < chars.len() {
-                if chars[end] == '{' {
-                    depth += 1;
-                } else if chars[end] == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
+struct Template<'a> {
+    args: &'a TplArgs,
+    global: &'a Global,
+    vars: HashMap<String, String>,
+    rng: ChaCha20Rng,
+}
+
+impl Template<'_> {
+    fn expand(&mut self, input: &str) -> Result<String> {
+        let mut out = String::new();
+        let chars: Vec<char> = input.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() {
+            if chars[idx] == '$' && chars.get(idx + 1) == Some(&'{') {
+                let start = idx + 2;
+                let mut depth = 1;
+                let mut end = start;
+                while end < chars.len() {
+                    if chars[end] == '{' {
+                        depth += 1;
+                    } else if chars[end] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
                     }
+                    end += 1;
                 }
-                end += 1;
+                if end >= chars.len() {
+                    return Err(PrismError::usage("unterminated template placeholder"));
+                }
+                let expr: String = chars[start..end].iter().collect();
+                let value = self.placeholder(&expr)?;
+                out.push_str(&value);
+                idx = end + 1;
+            } else {
+                out.push(chars[idx]);
+                idx += 1;
             }
-            if end >= chars.len() {
-                return Err(PrismError::usage("unterminated template placeholder"));
-            }
-            let expr: String = chars[start..end].iter().collect();
-            out.push_str(&expand_placeholder(&expr, args, global, vars, stack)?);
-            idx = end + 1;
+        }
+        Ok(out)
+    }
+
+    /// Like `expand`, but skips the scan for text with no placeholders.
+    fn expand_nested(&mut self, text: &str) -> Result<String> {
+        if text.contains("${") {
+            self.expand(text)
         } else {
-            out.push(chars[idx]);
-            idx += 1;
+            Ok(text.to_string())
         }
     }
-    Ok(out)
-}
 
-fn expand_placeholder(
-    expr: &str,
-    args: &TplArgs,
-    global: &Global,
-    vars: &HashMap<String, String>,
-    stack: &[String],
-) -> Result<String> {
-    if let Some(helper) = expr.strip_prefix('@') {
-        if args.no_gen {
-            return Err(PrismError::usage("@ helpers are disabled by --no-gen"));
+    fn placeholder(&mut self, expr: &str) -> Result<String> {
+        if let Some(helper) = expr.strip_prefix('@') {
+            if self.args.no_gen {
+                return Err(PrismError::usage("@ helpers are disabled by --no-gen"));
+            }
+            let helper = self.expand_nested(helper)?;
+            return self.helper(&helper);
         }
-        let helper = if helper.contains("${") {
-            expand_template_once(helper, args, global, vars, stack)?
-        } else {
-            helper.to_string()
+        let (key, op) = split_template_expr(expr);
+        let value = self.vars.get(key).cloned().unwrap_or_default();
+        // Operands expand lazily, as in the shell: `${A:-${B}}` only reads B when A is empty.
+        match op {
+            Some((":-", operand)) if value.is_empty() => self.expand_nested(operand),
+            Some((":-", _)) => Ok(value),
+            Some((":?", operand)) if value.is_empty() => {
+                let message = if operand.is_empty() {
+                    "required variable missing".to_string()
+                } else {
+                    self.expand_nested(operand)?
+                };
+                Err(PrismError::template(message))
+            }
+            Some((":?", _)) => Ok(value),
+            Some((":+", _)) if value.is_empty() => Ok(String::new()),
+            Some((":+", operand)) => self.expand_nested(operand),
+            Some((other, _)) => Err(PrismError::usage(format!(
+                "unsupported template operator: {other}"
+            ))),
+            None if value.is_empty() && self.args.strict => {
+                Err(PrismError::template(format!("{key} is required")))
+            }
+            None => Ok(value),
+        }
+    }
+
+    /// Helpers take `name[:arg...]`; the final argument is free text and may contain ':'.
+    fn helper(&mut self, helper: &str) -> Result<String> {
+        let unsupported = || PrismError::usage(format!("unsupported template helper: @{helper}"));
+        let (name, rest) = match helper.split_once(':') {
+            Some((name, rest)) => (name, Some(rest)),
+            None => (helper, None),
         };
-        return expand_helper(&helper, global);
-    }
-    let (key, op, operand) = split_template_expr(expr);
-    if stack.iter().any(|existing| existing == key) {
-        return Err(PrismError::recursion(format!("template cycle at {key}")));
-    }
-    let value = vars.get(key).cloned().unwrap_or_default();
-    match op {
-        Some(":-") => {
-            if value.is_empty() {
-                Ok(operand.unwrap_or_default().to_string())
-            } else {
-                Ok(value)
+        match (name, rest) {
+            ("uuid", None) => Ok(uuid4_from_rng(&mut self.rng).to_string()),
+            ("uuid7", None) => {
+                Ok(uuid7_from_rng(&mut self.rng, timestamp_ms(None, self.global)).to_string())
             }
-        }
-        Some(":?") => {
-            if value.is_empty() {
-                Err(PrismError::template(
-                    operand.unwrap_or("required variable missing").to_string(),
-                ))
-            } else {
-                Ok(value)
+            ("ulid", None) => {
+                Ok(ulid_from_rng(&mut self.rng, timestamp_ms(None, self.global)).to_string())
             }
-        }
-        Some(":+") => {
-            if value.is_empty() {
-                Ok(String::new())
-            } else {
-                Ok(operand.unwrap_or_default().to_string())
+            ("now", None) => Ok(Utc::now().to_rfc3339()),
+            ("now", Some(rest)) if rest.starts_with(['+', '-']) => {
+                let (offset, fmt) = rest.split_once(':').unwrap_or((rest, ""));
+                let dt = apply_offset(Utc::now().fixed_offset(), offset)?;
+                if fmt.is_empty() {
+                    Ok(dt.to_rfc3339())
+                } else {
+                    strftime(&dt, fmt)
+                }
             }
+            ("now", Some(fmt)) => strftime(&Utc::now(), fmt),
+            ("rand", Some(rest)) => {
+                let (kind, len) = rest.split_once(':').ok_or_else(unsupported)?;
+                let len = len
+                    .parse::<usize>()
+                    .map_err(|err| PrismError::usage(format!("invalid rand length: {err}")))?;
+                match kind {
+                    "hex" => {
+                        let mut bytes = vec![0_u8; len];
+                        self.rng.fill_bytes(&mut bytes);
+                        Ok(hex_encode(&bytes, false))
+                    }
+                    "alnum" => Ok(random_from_charset(&mut self.rng, ALNUM, len)),
+                    "words" => random_words(&mut self.rng, &load_wordlist(None)?, len, " "),
+                    _ => Err(unsupported()),
+                }
+            }
+            ("slug", Some(text)) => Ok(slugify(text, "-", None, false)),
+            ("case", Some(rest)) => match rest.split_once(':') {
+                Some(("snake", text)) => Ok(convert_case(text, CaseMode::Snake)),
+                _ => Err(unsupported()),
+            },
+            ("enc", Some(rest)) => match rest.split_once(':') {
+                Some(("base64", text)) => Ok(B64.encode(text.as_bytes())),
+                _ => Err(unsupported()),
+            },
+            ("hash", Some(rest)) => match rest.split_once(':') {
+                Some(("sha256", text)) => Ok(hex_encode(&Sha256::digest(text.as_bytes()), false)),
+                _ => Err(unsupported()),
+            },
+            _ => Err(unsupported()),
         }
-        Some(other) => Err(PrismError::usage(format!(
-            "unsupported template operator: {other}"
-        ))),
-        None if value.is_empty() && args.strict => {
-            Err(PrismError::template(format!("{key} is required")))
-        }
-        None => Ok(value),
     }
 }
 
-fn split_template_expr(expr: &str) -> (&str, Option<&str>, Option<&str>) {
-    for op in [":-", ":?", ":+"] {
-        if let Some((key, value)) = expr.split_once(op) {
-            return (key, Some(op), Some(value));
+/// Splits `KEY:-operand` style expressions at the first operator.
+fn split_template_expr(expr: &str) -> (&str, Option<(&str, &str)>) {
+    match expr.find(':') {
+        Some(idx) if expr.len() > idx + 1 && expr.is_char_boundary(idx + 2) => {
+            let (key, rest) = expr.split_at(idx);
+            let (op, operand) = rest.split_at(2);
+            (key, Some((op, operand)))
         }
+        _ => (expr, None),
     }
-    (expr, None, None)
-}
-
-fn expand_helper(helper: &str, global: &Global) -> Result<String> {
-    let parts: Vec<&str> = helper.split(':').collect();
-    match parts.as_slice() {
-        ["uuid"] => {
-            let args = RandArgs {
-                hex: None,
-                alnum: None,
-                alpha: None,
-                digits: None,
-                base32: None,
-                base64: None,
-                ascii: None,
-                charset: None,
-                len: None,
-                uuid: true,
-                uuid7: false,
-                ulid: false,
-                words: None,
-                sep: " ".to_string(),
-                wordlist: None,
-                bytes: None,
-                now: None,
-            };
-            let mut rng = rng_from_global(global, "tpl @uuid");
-            rand_text(&args, global, &mut rng)
-        }
-        ["uuid7"] => {
-            let args = RandArgs {
-                hex: None,
-                alnum: None,
-                alpha: None,
-                digits: None,
-                base32: None,
-                base64: None,
-                ascii: None,
-                charset: None,
-                len: None,
-                uuid: false,
-                uuid7: true,
-                ulid: false,
-                words: None,
-                sep: " ".to_string(),
-                wordlist: None,
-                bytes: None,
-                now: None,
-            };
-            let mut rng = rng_from_global(global, "tpl @uuid7");
-            rand_text(&args, global, &mut rng)
-        }
-        ["ulid"] => {
-            let args = RandArgs {
-                hex: None,
-                alnum: None,
-                alpha: None,
-                digits: None,
-                base32: None,
-                base64: None,
-                ascii: None,
-                charset: None,
-                len: None,
-                uuid: false,
-                uuid7: false,
-                ulid: true,
-                words: None,
-                sep: " ".to_string(),
-                wordlist: None,
-                bytes: None,
-                now: None,
-            };
-            let mut rng = rng_from_global(global, "tpl @ulid");
-            rand_text(&args, global, &mut rng)
-        }
-        ["now"] => Ok(Utc::now().to_rfc3339()),
-        ["now", fmt] => Ok(Utc::now().format(fmt).to_string()),
-        ["now", offset, fmt] => {
-            let dt = Utc::now().fixed_offset();
-            Ok(apply_offset(dt, offset)?.format(fmt).to_string())
-        }
-        ["rand", "hex", len] => helper_rand_hex(global, len),
-        ["rand", "alnum", len] => helper_rand_alnum(global, len),
-        ["rand", "words", len] => helper_rand_words(global, len),
-        ["slug", text] => Ok(slugify(text, "-", None, false)),
-        ["case", "snake", text] => Ok(convert_case(text, CaseMode::Snake)),
-        ["enc", "base64", text] => Ok(B64.encode(text.as_bytes())),
-        ["hash", "sha256", text] => Ok(hex_encode(&Sha256::digest(text.as_bytes()), false)),
-        _ => Err(PrismError::usage(format!(
-            "unsupported template helper: @{helper}"
-        ))),
-    }
-}
-
-fn helper_rand_hex(global: &Global, len: &str) -> Result<String> {
-    let len = len
-        .parse::<usize>()
-        .map_err(|err| PrismError::usage(format!("invalid rand length: {err}")))?;
-    let mut rng = rng_from_global(global, "tpl @rand:hex");
-    let mut bytes = vec![0_u8; len];
-    rng.fill_bytes(&mut bytes);
-    Ok(hex_encode(&bytes, false))
-}
-
-fn helper_rand_alnum(global: &Global, len: &str) -> Result<String> {
-    let len = len
-        .parse::<usize>()
-        .map_err(|err| PrismError::usage(format!("invalid rand length: {err}")))?;
-    let mut rng = rng_from_global(global, "tpl @rand:alnum");
-    Ok(random_from_charset(
-        &mut rng,
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-        len,
-    ))
-}
-
-fn helper_rand_words(global: &Global, len: &str) -> Result<String> {
-    let len = len
-        .parse::<usize>()
-        .map_err(|err| PrismError::usage(format!("invalid rand length: {err}")))?;
-    let mut rng = rng_from_global(global, "tpl @rand:words");
-    let words = load_wordlist(None)?;
-    let mut selected = Vec::with_capacity(len);
-    for _ in 0..len {
-        let word = words
-            .choose(&mut rng)
-            .ok_or_else(|| PrismError::runtime("wordlist is empty"))?;
-        selected.push(word.clone());
-    }
-    Ok(selected.join(" "))
 }
 
 fn quote_value(value: &str, kind: QuoteKind) -> Result<String> {
@@ -3481,7 +3458,11 @@ fn parse_chain_stages(chain: &str, global: &Global) -> Result<Vec<ParsedStage>> 
                 "a generator may only be the first chain stage",
             ));
         }
-        if idx == 0 && global.count.is_some() && !is_generator_command(&cli.command) {
+        if idx == 0
+            && global.count.is_some()
+            && !global.count_from_config
+            && !is_generator_command(&cli.command)
+        {
             return Err(PrismError::usage(
                 "-n applies only when the first chain stage is a generator",
             ));
@@ -3529,13 +3510,13 @@ fn merge_stage_global(outer: &Global, stage: &Global) -> Global {
     let mut merged = outer.clone();
     if stage.count.is_some() {
         merged.count = stage.count;
+        merged.count_from_config = false;
     }
     if stage.seed.is_some() {
         merged.seed = stage.seed.clone();
     }
     merged.null |= stage.null;
     merged.no_newline |= stage.no_newline;
-    merged.raw |= stage.raw;
     merged.json |= stage.json;
     merged.keep_going |= stage.keep_going;
     merged.quiet |= stage.quiet;
@@ -3611,13 +3592,9 @@ fn inject_alias_args(chain: &str, args: &[String]) -> Result<String> {
         .ok_or_else(|| PrismError::usage("alias chain is empty"))?;
     for arg in args {
         first.push(' ');
-        first.push_str(&quote_shell_for_chain(arg));
+        first.push_str(&quote_shell(arg));
     }
     Ok(stages.join(" | "))
-}
-
-fn quote_shell_for_chain(value: &str) -> String {
-    quote_shell(value)
 }
 
 fn command_alias(command: &AliasCommand) -> Result<String> {
@@ -3643,7 +3620,12 @@ fn command_alias(command: &AliasCommand) -> Result<String> {
                 .ok_or_else(|| PrismError::runtime(format!("alias not found: {name}")))
         }
         AliasCommand::Add { name, chain } => {
-            let mut config = load_config().unwrap_or_default();
+            if name == "options" {
+                return Err(PrismError::usage(
+                    "'options' is reserved for [alias.options]; pick another alias name",
+                ));
+            }
+            let mut config = load_config()?;
             config.alias.entries.insert(name.clone(), chain.clone());
             save_config(&config)?;
             Ok(name.clone())
@@ -3682,8 +3664,9 @@ fn save_config(config: &Config) -> Result<()> {
     }
     let content = toml::to_string_pretty(config)
         .map_err(|err| PrismError::runtime(format!("could not serialize config: {err}")))?;
-    fs::write(path, content)?;
-    Ok(())
+    write_atomic_file(&path, &Global::default(), |file| {
+        file.write_all(content.as_bytes()).map_err(PrismError::from)
+    })
 }
 
 fn decode_escapes(value: &str) -> String {
@@ -3695,7 +3678,7 @@ fn decode_escapes(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::*;
 
     #[test]
     fn field_range_selects_to_last() {

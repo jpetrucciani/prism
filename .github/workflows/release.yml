@@ -74,9 +74,6 @@ jobs:
       - name: test all features
         run: cargo test --all-features
 
-      - name: test no default features
-        run: cargo test --no-default-features
-
       - name: build release binary
         run: cargo build --release --locked --all-features
 

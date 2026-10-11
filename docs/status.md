@@ -10,7 +10,6 @@ Local validation last run in this workspace:
 cargo fmt --check
 cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 cargo test --all-features
-cargo test --no-default-features
 RUSTFLAGS="${RUSTFLAGS:-} -A linker-messages" cargo zigbuild --release --locked --all-features --target x86_64-unknown-linux-musl
 python3 scripts/perf_matrix.py --build --iterations 5 --warmups 1 --output target/perf-matrix.md
 ```

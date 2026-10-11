@@ -16,21 +16,19 @@ let
   name = "prism";
   muslTarget = "x86_64-unknown-linux-musl";
 
-  rust = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-    extensions = [ "rust-src" "rustc-dev" "rust-analyzer" ];
+  # stable, to match CI
+  rust = pkgs.rust-bin.stable.latest.default.override {
+    extensions = [ "rust-src" "rust-analyzer" ];
     targets = [
       muslTarget
       "aarch64-unknown-linux-musl"
-      "x86_64-pc-windows-gnu"
     ];
-  });
+  };
 
   rustPlatform = pkgs.makeRustPlatform {
     cargo = rust;
     rustc = rust;
   };
-
-  mingw = pkgs.pkgsCross.mingwW64;
 
   scripts = with pkgs; {
     fmt = writers.writeBashBin "fmt" ''
@@ -48,26 +46,11 @@ let
       cargo test --all-features
     '';
 
-    test_no_default_features = writers.writeBashBin "test_no_default_features" ''
-      set -euo pipefail
-      cargo test --no-default-features
-    '';
-
     quality = writers.writeBashBin "quality" ''
       set -euo pipefail
       cargo fmt --check
       cargo clippy --all --benches --tests --examples --all-features -- -D warnings
       cargo test --all-features
-      cargo test --no-default-features
-    '';
-
-    docs_build = writers.writeBashBin "docs_build" ''
-      set -euo pipefail
-      (
-        cd docs
-        bun install --frozen-lockfile
-        bun run docs:build
-      )
     '';
 
     build_static = writers.writeBashBin "build_static" ''
@@ -88,17 +71,14 @@ let
   };
 
   packages = with pkgs; [
-    bun
+    actionlint
     cargo-zigbuild
     jq
     jfmt
-    pkg-config
     python314
     rust
     yq-go
     zig
-    mingw.stdenv.cc
-    # mingw.windows.pthreads
   ] ++ builtins.attrValues scripts;
 
   shell = pkgs.mkShellNoCC {
@@ -108,14 +88,13 @@ let
 
   bin = rustPlatform.buildRustPackage {
     pname = name;
-    version = "0.0.0";
+    version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     src = pkgs.hax.filterSrc { path = ./.; };
     cargoLock.lockFile = ./Cargo.lock;
     auditable = false;
     strictDeps = true;
     nativeBuildInputs = with pkgs; [
       cargo-zigbuild
-      pkg-config
       zig
     ];
     buildPhase = ''

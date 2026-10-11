@@ -23,7 +23,6 @@ The CI gate for Rust changes is:
 cargo fmt --check
 cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 cargo test --all-features
-cargo test --no-default-features
 ```
 
 Release-readiness CI also needs:
@@ -68,13 +67,13 @@ Golden tests should prefer byte assertions over string assertions when record se
 | `-o`           | Atomic success, fail-fast cleanup, existing mode preservation, new-file umask behavior where portable, missing parent error.        |
 | `--append`     | Appends without replacing existing content.                                                                                         |
 | `--mkdir`      | Creates missing parent directories for `-o`.                                                                                        |
-| `--mode`       | Applies requested mode on create/replace.                                                                                           |
+| `--file-mode`  | Applies requested mode on create/replace.                                                                                           |
 | `-n`           | Works for generators, errors for non-generator first stages in chains, no-op or usage behavior matches command docs outside chains. |
 | `--seed`       | Stable output for every seeded command.                                                                                             |
 | `-0`           | Splits and joins on NUL, preserves interior empty records.                                                                          |
 | `--no-newline` | Removes only final terminator.                                                                                                      |
-| `--raw`        | Suppresses verb-specific quoting where supported.                                                                                   |
-| `--json`       | JSON-renders every text record and rejects `--raw`.                                                                                 |
+| `--no-defaults` | Ignores config `[defaults]` for one invocation.                                                                                    |
+| `--json`       | JSON-renders every text record.                                                                                                     |
 | `--keep-going` | Emits successes, logs failures, exits nonzero when any record fails.                                                                |
 | `--quiet`      | Suppresses non-fatal notes, especially binary-mode rendering notes.                                                                 |
 

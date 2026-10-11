@@ -566,10 +566,6 @@ fn output_errors_append_and_flag_conflicts() {
     assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
     assert!(stdout.is_empty());
     assert_eq!(fs::read(&target).expect("read append"), b"old\nNEW\n");
-
-    let (code, _stdout, stderr) = run(["--raw", "--json", "case", "upper"], b"abc\n");
-    assert_eq!(code, 2);
-    assert!(String::from_utf8_lossy(&stderr).contains("mutually exclusive"));
 }
 
 #[test]
@@ -1184,4 +1180,183 @@ fn config_defaults_cover_supported_global_defaults() {
         .lines()
         .all(|line| line.starts_with('"') && line.ends_with('"')));
     assert!(!text.ends_with('\n'));
+}
+
+fn write_config(name: &str, contents: &str) -> PathBuf {
+    let config_home = temp_dir(name).join("config");
+    let config_dir = config_home.join("prism");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::write(config_dir.join("config.toml"), contents).expect("write config");
+    config_home
+}
+
+#[test]
+fn bad_user_input_errors_instead_of_panicking() {
+    let cases: Vec<(Vec<&str>, &[u8], i32)> = vec![
+        (vec!["dt", "--utc", "--fmt", "%Q"], b"", 2),
+        (vec!["tpl", "${@now:%Q}"], b"", 2),
+        (vec!["dt", "--utc", "+200000000d"], b"", 1),
+        (vec!["dt", "--utc", "+2000000000y"], b"", 1),
+        (vec!["enc", "ascii85", "-d", "uuuuu"], b"", 1),
+    ];
+    for (args, stdin, expected) in cases {
+        let (code, _stdout, stderr) = run(args.clone(), stdin);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(code, expected, "args {args:?}, stderr: {stderr}");
+        assert!(
+            !stderr.contains("panicked"),
+            "args {args:?}, stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn reserved_alias_name_is_rejected_and_config_stays_valid() {
+    let config_home = write_config("alias-reserved", "");
+    let envs = [("XDG_CONFIG_HOME", &config_home)];
+    let (code, _stdout, stderr) = run_with_env(["alias", "add", "options", "trim"], b"", &envs);
+    assert_eq!(code, 2);
+    assert!(String::from_utf8_lossy(&stderr).contains("reserved"));
+    let (code, stdout, stderr) = run_with_env(["case", "upper", "hi"], b"", &envs);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"HI\n");
+}
+
+#[test]
+fn config_defaults_do_not_break_chains_and_can_be_ignored() {
+    let config_home = write_config("defaults-chain", "[defaults]\ncount = 2\njson = true\n");
+    let envs = [("XDG_CONFIG_HOME", &config_home)];
+    let (code, stdout, stderr) = run_with_env(["do", "trim | case upper"], b" x \n", &envs);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"\"X\"\n");
+
+    let (code, stdout, stderr) = run_with_env(["--no-defaults", "case", "upper"], b"x\n", &envs);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"X\n");
+
+    let (code, _stdout, stderr) = run_with_env(["-n", "2", "do", "trim"], b"x\n", &envs);
+    assert_eq!(code, 2);
+    assert!(String::from_utf8_lossy(&stderr).contains("-n applies only"));
+}
+
+#[test]
+fn closed_stdout_pipe_exits_quietly() {
+    let mut child = Command::new(bin())
+        .args(["seq", "1..5000000"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn prism");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut first = [0_u8; 2];
+    std::io::Read::read_exact(&mut stdout, &mut first).expect("read first bytes");
+    assert_eq!(&first, b"1\n");
+    drop(stdout);
+    let output = child.wait_with_output().expect("wait prism");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn template_defaults_helpers_and_seeded_repeats() {
+    let (code, stdout, stderr) = run(
+        [
+            "tpl",
+            "--set",
+            "B=fallback",
+            "${MISSING_VAR_X:-${B}} ${B:+set-${B}}",
+        ],
+        b"",
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"fallback set-fallback\n");
+
+    let (code, stdout, stderr) = run(["tpl", "${@now:%H:%M:%S}"], b"");
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    let text = String::from_utf8(stdout).expect("utf8");
+    assert_eq!(text.trim().len(), 8);
+    assert_eq!(text.matches(':').count(), 2);
+
+    let template = "${@rand:hex:4} ${@rand:hex:4} ${@uuid} ${@uuid}";
+    let (code, one, stderr) = run(["--seed", "s", "tpl", template], b"");
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    let (_code, two, _stderr) = run(["--seed", "s", "tpl", template], b"");
+    assert_eq!(one, two);
+    let one = String::from_utf8(one).expect("utf8");
+    let parts: Vec<&str> = one.split_whitespace().collect();
+    assert_ne!(parts[0], parts[1]);
+    assert_ne!(parts[2], parts[3]);
+}
+
+#[test]
+fn transform_edge_cases_match_documented_semantics() {
+    let cases: Vec<(Vec<&str>, &[u8], &[u8])> = vec![
+        (
+            vec!["pad", "--left", "6", "--fill", "ab", "x"],
+            b"",
+            b"ababax\n",
+        ),
+        (
+            vec!["pad", "--right", "6", "--fill", "\u{4e00}", "x"],
+            b"",
+            "x\u{4e00}\u{4e00} \n".as_bytes(),
+        ),
+        (vec!["field", "2", "-d", "\\t"], b"a\tb\tc\n", b"b\n"),
+        (vec!["slice", "--", "-10"], b"abc\n", b"\n"),
+        (vec!["slice", "--graphemes", "--", "-10"], b"abc\n", b"\n"),
+        (
+            vec!["lines", "--uniq", "--number"],
+            b"a\na\nb\n",
+            b"1\ta\n2\tb\n",
+        ),
+        (
+            vec!["dt", "--utc", "--at", "2026-01-01T00:00:00+05:00"],
+            b"",
+            b"2025-12-31T19:00:00+00:00\n",
+        ),
+        (vec!["trim"], b"\n", b""),
+    ];
+    for (args, stdin, expected) in cases {
+        let (code, stdout, stderr) = run(args.clone(), stdin);
+        assert_eq!(
+            code,
+            0,
+            "args {args:?}, stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(expected),
+            "args {args:?}"
+        );
+    }
+}
+
+#[test]
+fn record_transforms_stream_before_stdin_closes() {
+    use std::io::BufRead;
+    let mut child = Command::new(bin())
+        .args(["case", "upper"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn prism");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"a\n").expect("write stdin");
+    stdin.flush().expect("flush stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(stdin);
+    child.wait().expect("wait prism");
+    assert_eq!(line.expect("first record before EOF"), "A\n");
 }

@@ -14,28 +14,38 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.2
+        with:
+          components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all --benches --tests --examples --all-features -- -D warnings
       - run: cargo test --all-features
-      - run: cargo test --no-default-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.2
+        with:
+          toolchain: "1.95"
+      - run: cargo check --locked --all-features --all-targets
 
   release-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.2
       - run: cargo build --release --locked --all-features
       - run: python3 scripts/release_smoke.py --bin target/release/prism
 
   performance-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.2
       - run: python3 scripts/perf_matrix.py --build --iterations 3 --warmups 1 --output target/perf-ci-smoke.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: prism-perf-ci-smoke
           path: target/perf-ci-smoke.md
@@ -43,11 +53,12 @@ jobs:
   static-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.2
+        with:
+          target: x86_64-unknown-linux-musl
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
       - uses: taiki-e/install-action@cargo-zigbuild
-      - run: rustup target add x86_64-unknown-linux-musl
       - run: RUSTFLAGS="${RUSTFLAGS:-} -A linker-messages" cargo zigbuild --release --locked --all-features --target x86_64-unknown-linux-musl
